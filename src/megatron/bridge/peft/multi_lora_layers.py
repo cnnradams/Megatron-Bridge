@@ -31,6 +31,7 @@ adapter-major order, so ``tokens_per_adapter`` alone cannot segment it;
 dispatcher to recover the per-(slot, expert) segmentation.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -53,6 +54,8 @@ from megatron.bridge.peft.utils import (
     all2all_hp2sp,
     get_adapter_attributes_from_linear,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MultiLoRALinear(AdapterWrapper):
@@ -106,7 +109,21 @@ class MultiLoRALinear(AdapterWrapper):
             assert parallel_state.get_tensor_model_parallel_world_size() == 1, (
                 f"{full_name}: split_projections is not implemented for TP>1"
             )
-            self.n_projections = max(pid for _, pid in self.split_projections) + 1
+            # A name-keyed split spec can match same-named modules of other
+            # sizes (e.g. a VL model's vision tower linear_qkv); those fall
+            # back to a single fused adapter rather than failing the build.
+            rows = sum(size for size, _ in self.split_projections)
+            attrs_out = get_adapter_attributes_from_linear(to_wrap).out_features
+            if rows != attrs_out:
+                logger.warning(
+                    "%s: split_projections rows (%d) != output rows (%d); using a fused adapter",
+                    full_name,
+                    rows,
+                    attrs_out,
+                )
+                self.split_projections = None
+            else:
+                self.n_projections = max(pid for _, pid in self.split_projections) + 1
         self.max_rank = dim * self.n_projections
         # Kept so a slot re-init (reset_adapter) mirrors the construction-time
         # init methods instead of hardcoding xavier/zero.
@@ -178,11 +195,6 @@ class MultiLoRALinear(AdapterWrapper):
             "user_rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
         if self.split_projections:
-            rows = sum(size for size, _ in self.split_projections)
-            out_features = self.adapters[0].linear_out.weight.shape[0]
-            assert rows == out_features, (
-                f"{full_name}: split_projections rows ({rows}) != adapter output rows ({out_features})"
-            )
             self._row_projection_ids = torch.cat(
                 [torch.full((size,), pid, dtype=torch.long) for size, pid in self.split_projections]
             )
