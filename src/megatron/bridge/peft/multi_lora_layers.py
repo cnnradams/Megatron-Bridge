@@ -78,6 +78,7 @@ class MultiLoRALinear(AdapterWrapper):
         dropout: float = 0.0,
         dropout_position: str = "pre",
         a2a_experimental: bool = False,
+        split_projections: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         nn.Module.__init__(self)
         # The grouped-GEMM forward below never runs each adapter's own
@@ -90,8 +91,23 @@ class MultiLoRALinear(AdapterWrapper):
         self.to_wrap = to_wrap
         self._adapter_enabled = True
         self.n_adapters = n_adapters
-        self.max_rank = dim
         self.base_linear_name = full_name
+        # split_projections describes a fused base linear (e.g. linear_qkv =
+        # q|k|v per GQA group, gated linear_fc1 = gate|up) as (rows,
+        # projection_id) segments over the full output dim. When set, each
+        # slot trains an independent rank-r adapter per projection —
+        # equivalent to per-projection LoRA — by claiming effective rank
+        # n_projections*r with a block-diagonal B (see init_adapter_slot).
+        # Buffers are sized n_projections*dim so the advertised
+        # per-projection max rank stays `dim`.
+        self.split_projections = list(split_projections) if split_projections else None
+        self.n_projections = 1
+        if self.split_projections:
+            assert parallel_state.get_tensor_model_parallel_world_size() == 1, (
+                f"{full_name}: split_projections is not implemented for TP>1"
+            )
+            self.n_projections = max(pid for _, pid in self.split_projections) + 1
+        self.max_rank = dim * self.n_projections
         # Kept so a slot re-init (reset_adapter) mirrors the construction-time
         # init methods instead of hardcoding xavier/zero.
         self._column_init_method = column_init_method
@@ -125,7 +141,7 @@ class MultiLoRALinear(AdapterWrapper):
                 ParallelLinearAdapter(
                     in_features=attrs.in_features,
                     out_features=attrs.out_features,
-                    dim=dim,
+                    dim=self.max_rank,
                     base_linear_name=full_name,
                     activation="identity",
                     alpha=alpha,
@@ -153,8 +169,23 @@ class MultiLoRALinear(AdapterWrapper):
         # Non-persistent: slot lifecycle is externally managed, not checkpointed.
         self.register_buffer("alpha_values", torch.ones(n_adapters, dtype=dtype, device=device), persistent=False)
         self.register_buffer(
-            "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
+            "rank_values", torch.full((n_adapters,), self.max_rank, dtype=dtype, device=device), persistent=False
         )
+        # Requested (per-projection) rank; rank_values holds the claimed
+        # effective rank (n_projections * requested). Runtime scaling is
+        # alpha / requested rank, matching per-projection LoRA semantics.
+        self.register_buffer(
+            "user_rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
+        )
+        if self.split_projections:
+            rows = sum(size for size, _ in self.split_projections)
+            out_features = self.adapters[0].linear_out.weight.shape[0]
+            assert rows == out_features, (
+                f"{full_name}: split_projections rows ({rows}) != adapter output rows ({out_features})"
+            )
+            self._row_projection_ids = torch.cat(
+                [torch.full((size,), pid, dtype=torch.long) for size, pid in self.split_projections]
+            )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
@@ -220,7 +251,7 @@ class MultiLoRALinear(AdapterWrapper):
         # ratio into an fp32 accumulator. Where train/rollout parity at that
         # level matters, keep alpha/rank ratios exactly representable; closing
         # the gap entirely would require applying the scaling in fp32.
-        scaling = self.alpha_values / self.rank_values
+        scaling = self.alpha_values / self.user_rank_values
         per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
         out = out * per_token_scaling
 
@@ -256,17 +287,65 @@ class MultiLoRALinear(AdapterWrapper):
             row_fn(adapter.linear_out.weight.data)
 
     def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
-        """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
-        assert 0 < rank <= self.max_rank, f"Adapter rank {rank} must be in (0, {self.max_rank}]"
+        """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask.
+
+        On a split (fused) base linear the slot claims ``n_projections * rank``
+        effective ranks — one independent rank-``rank`` block per projection —
+        while runtime scaling stays ``alpha / rank``.
+        """
+        effective_rank = rank * self.n_projections
+        assert 0 < effective_rank <= self.max_rank, (
+            f"Adapter rank {rank} must be in (0, {self.max_rank // self.n_projections}] "
+            f"for {self.base_linear_name}"
+        )
         self.alpha_values[idx] = alpha
-        self.rank_values[idx] = rank
+        self.user_rank_values[idx] = rank
+        self.rank_values[idx] = effective_rank
         self._apply_rank_mask(idx)
+        self._install_split_grad_mask(idx)
 
     def clear_adapter_slot(self, idx: int) -> None:
         """Free slot ``idx``: zero alpha, restore max rank, re-init weights."""
         self.alpha_values[idx] = 0
         self.rank_values[idx] = self.max_rank
+        self.user_rank_values[idx] = self.max_rank
+        handle = getattr(self.adapters[idx], "_split_grad_mask_handle", None)
+        if handle is not None:
+            handle.remove()
+            self.adapters[idx]._split_grad_mask_handle = None
         self.reset_adapter(idx)
+
+    def _install_split_grad_mask(self, idx: int) -> None:
+        """Keep slot ``idx``'s B block-diagonal on a split base linear.
+
+        B starts zero, so constraining its *gradient* to the block-diagonal
+        pattern (output rows of projection ``p`` ↔ A-block ``p``'s columns)
+        keeps B block-diagonal forever, including optimizer state. Through the
+        A·B autograd chain this makes each (A-block, B-block) pair train
+        exactly like an independent per-projection LoRA. The mask is built per
+        backward from the per-row projection ids rather than materialized —
+        a full [out, max_rank] mask per slot per layer would cost ~1GB.
+        """
+        adapter = self.adapters[idx]
+        handle = getattr(adapter, "_split_grad_mask_handle", None)
+        if handle is not None:
+            handle.remove()
+            adapter._split_grad_mask_handle = None
+        if self.n_projections == 1:
+            return
+        weight = adapter.linear_out.weight
+        row_ids = self._row_projection_ids.to(weight.device)
+        rank = int(self.user_rank_values[idx].item())
+        effective_rank = rank * self.n_projections
+
+        def _mask(grad: torch.Tensor) -> torch.Tensor:
+            cols = torch.arange(grad.shape[1], device=grad.device)
+            keep = ((cols // rank).unsqueeze(0) == row_ids.unsqueeze(1)) & (cols < effective_rank)
+            return grad * keep
+
+        with torch.no_grad():
+            weight.data.copy_(_mask(weight.data))
+        adapter._split_grad_mask_handle = weight.register_hook(_mask)
 
     def _apply_rank_mask(self, idx: int) -> None:
         """Zero padded rows of A and padded cols of B for slot ``idx``.
@@ -394,6 +473,8 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self.n_adapters = n_adapters
         self.max_rank = dim
         self.base_linear_name = full_name
+        self.split_projections = None
+        self.n_projections = 1
         self.num_local_experts = num_local_experts
         self._column_init_method = column_init_method
         self._row_init_method = row_init_method
@@ -495,6 +576,9 @@ class MultiLoRAGroupedExpertLinear(MultiLoRALinear):
         self.register_buffer("alpha_values", torch.ones(n_adapters, dtype=dtype, device=device), persistent=False)
         self.register_buffer(
             "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
+        )
+        self.register_buffer(
+            "user_rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -971,7 +1055,7 @@ def expose_adapter_slot(model, idx: int):
                 saved[id(m)] = m._modules.pop("adapters")
                 adapter = saved[id(m)][idx]
                 saved_alphas[id(m)] = adapter.alpha
-                adapter.alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.rank_values[idx])
+                adapter.alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.user_rank_values[idx])
                 m.adapter = adapter
 
         # try/finally: an exception in the body (e.g. an export/save error, which

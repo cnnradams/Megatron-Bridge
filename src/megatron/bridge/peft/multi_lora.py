@@ -21,7 +21,7 @@ and is managed by standalone functions in :mod:`multi_lora_layers`.
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -82,6 +82,11 @@ class MultiLoRA(PEFT, ModuleMatcher):
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = False
     experts_shared_outer_loras: bool = False
+    # Per-target (rows, projection_id) segment layouts for fused base linears
+    # (e.g. {"linear_qkv": [...], "linear_fc1": [...]}); targets present here
+    # train one independent rank-r adapter per projection instead of a single
+    # shared-A adapter over the fused output. See MultiLoRALinear.
+    split_target_segments: Dict[str, List[Tuple[int, int]]] = field(default_factory=dict)
 
     def __call__(self, model, training: bool = True):
         """Apply multi-LoRA, then install MoE slot routing for wrapped expert linears."""
@@ -173,6 +178,8 @@ class MultiLoRA(PEFT, ModuleMatcher):
                 dropout=self.dropout,
                 dropout_position=self.dropout_position,
                 a2a_experimental=self.a2a_experimental,
+                split_projections=self.split_target_segments.get(match)
+                or self.split_target_segments.get(name),
             )
 
         return module
