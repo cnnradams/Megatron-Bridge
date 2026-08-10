@@ -152,6 +152,14 @@ class MultiLoRA(PEFT, ModuleMatcher):
             if isinstance(module, TopKRouter):
                 return module
 
+            if next(module.parameters(), None) is None:
+                # Some architectures (e.g. Qwen3.5 gated-delta-net layers) expose
+                # target-named modules that hold no parameters themselves;
+                # MultiLoRALinear needs a parameter to infer device/dtype and
+                # there is no weight to adapt, so skip instead of crashing.
+                logger.warning("Skipping multi-lora on parameterless module: %s (%s)", full_name, type(module).__name__)
+                return module
+
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
             return MultiLoRALinear(
