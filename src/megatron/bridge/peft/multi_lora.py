@@ -32,6 +32,7 @@ from megatron.bridge.peft.module_matcher import ModuleMatcher
 from megatron.bridge.peft.multi_lora_layers import (
     MultiLoRAGroupedExpertLinear,
     MultiLoRALinear,
+    MultiLoRALinearSplitMambaInProj,
     MultiLoRALinearSplitQKV,
     install_moe_slot_routing,
 )
@@ -62,6 +63,8 @@ class MultiLoRA(PEFT, ModuleMatcher):
         lora_dtype: Data type for adapter weights.
         split_qkv: Store independent Q, K, and V low-rank pairs in each
             ``linear_qkv`` adapter slot.
+        split_mamba: Store independent gate and x low-rank pairs in each
+            Mamba ``mixer.in_proj`` adapter slot.
         normalize_moe_lora: Unsupported for multi-LoRA; see :meth:`__call__`.
         share_expert_adapters: Unsupported for multi-LoRA; see :meth:`__call__`.
         experts_shared_outer_loras: Unsupported for multi-LoRA; see :meth:`__call__`.
@@ -80,6 +83,7 @@ class MultiLoRA(PEFT, ModuleMatcher):
     a2a_experimental: bool = False
     lora_dtype: Optional[torch.dtype] = None
     split_qkv: bool = False
+    split_mamba: bool = False
     # Accepted (rather than rejected as unknown kwargs) so callers that share an
     # argument surface with single-LoRA get an explicit error instead of a
     # silently different adapter layout. Validated in __call__.
@@ -158,7 +162,12 @@ class MultiLoRA(PEFT, ModuleMatcher):
 
             logger.info(f"Adding multi-lora ({self.n_adapters} adapters) to: {full_name}")
 
-            wrapper_cls = MultiLoRALinearSplitQKV if self.split_qkv and name == "linear_qkv" else MultiLoRALinear
+            if self.split_qkv and name == "linear_qkv":
+                wrapper_cls = MultiLoRALinearSplitQKV
+            elif self.split_mamba and name == "in_proj" and full_name.endswith(".mixer.in_proj"):
+                wrapper_cls = MultiLoRALinearSplitMambaInProj
+            else:
+                wrapper_cls = MultiLoRALinear
             return wrapper_cls(
                 to_wrap=module,
                 n_adapters=self.n_adapters,

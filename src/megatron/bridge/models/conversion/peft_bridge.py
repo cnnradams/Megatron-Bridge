@@ -85,6 +85,7 @@ ADAPTER_NAME_MAP = {
     ".k_proj.weight": "adapter_k",
     ".v_proj.weight": "adapter_v",
     ".gate_proj.weight": "adapter_gate",
+    ".x_proj.weight": "adapter_x",
     ".up_proj.weight": "adapter_up",
 }
 ADAPTER_KEY_TO_SUFFIX = {value: key for key, value in ADAPTER_NAME_MAP.items()}
@@ -128,6 +129,17 @@ def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expecte
 
     hf_param = base_mapping.hf_param
     if isinstance(hf_param, str):
+        adapter_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
+        if (
+            adapter_suffix
+            and hf_param.endswith(".in_proj.weight")
+            and adapter_key
+            in {
+                "adapter_gate",
+                "adapter_x",
+            }
+        ):
+            return hf_param[: -len(".in_proj.weight")] + adapter_suffix
         return hf_param if hf_param.endswith(expected_suffix) or expected_suffix == ".weight" else None
 
     if isinstance(hf_param, dict):
@@ -226,6 +238,17 @@ class MegatronPeftBridge:
 
         hf_param = base_mapping.hf_param
         if isinstance(hf_param, str):
+            adapter_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
+            if (
+                adapter_suffix
+                and hf_param.endswith(".in_proj.weight")
+                and adapter_key
+                in {
+                    "adapter_gate",
+                    "adapter_x",
+                }
+            ):
+                return [hf_param[: -len(".in_proj.weight")] + adapter_suffix]
             return [hf_param]
 
         values = list(hf_param.values())

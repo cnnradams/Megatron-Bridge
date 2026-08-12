@@ -379,6 +379,82 @@ class MultiLoRALinearSplitQKV(MultiLoRALinear):
         return linear_output + adapter_output.reshape(linear_output.shape), bias
 
 
+class MultiLoRALinearSplitMambaInProj(MultiLoRALinear):
+    """Multi-slot LoRA for Mamba's packed ``[z, x, B, C, dt]`` input projection.
+
+    Tinker exposes independent ``gate_proj`` (``z``) and ``x_proj`` adapters.
+    The Mamba state-space ``B``, ``C``, and ``dt`` rows remain unmodified.
+    """
+
+    def _projection_sizes(self, attrs: AdapterAttributes) -> Tuple[int, int]:
+        config = getattr(self.to_wrap, "config", None)
+        num_heads = getattr(config, "mamba_num_heads", None)
+        head_dim = getattr(config, "mamba_head_dim", None)
+        if num_heads is not None and head_dim is not None:
+            d_inner = int(num_heads) * int(head_dim)
+            if d_inner <= 0 or attrs.out_features < 2 * d_inner:
+                raise ValueError(
+                    f"{self.base_linear_name}: invalid Mamba inner size {d_inner} for output size {attrs.out_features}"
+                )
+            return d_inner, d_inner
+
+        partition_sizes = getattr(self.to_wrap.weight, "partition_sizes", None)
+        if partition_sizes is None or len(partition_sizes) != 5:
+            raise ValueError(
+                f"{self.base_linear_name}: Mamba in_proj must expose five "
+                "[z, x, B, C, dt] partition sizes or mamba head dimensions"
+            )
+        local_sizes = tuple(int(size) for size in partition_sizes)
+        local_output_size = sum(local_sizes)
+        if local_output_size <= 0 or attrs.out_features % local_output_size:
+            raise ValueError(
+                f"{self.base_linear_name}: global output size {attrs.out_features} "
+                f"is incompatible with local Mamba partitions {local_sizes}"
+            )
+        tensor_parallel_size = attrs.out_features // local_output_size
+        return (
+            local_sizes[0] * tensor_parallel_size,
+            local_sizes[1] * tensor_parallel_size,
+        )
+
+    def _build_adapter_slot(self, attrs: AdapterAttributes) -> ModuleDict:
+        gate_out_features, x_out_features = self._projection_sizes(attrs)
+        return ModuleDict(
+            {
+                "adapter_gate": self._build_adapter(attrs, gate_out_features),
+                "adapter_x": self._build_adapter(attrs, x_out_features),
+            }
+        )
+
+    def _slot_adapters(self, idx: int) -> Tuple[ParallelLinearAdapter, ...]:
+        slot = self.adapters[idx]
+        return tuple(slot.values())
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        x_flat, tokens_per_adapter = self._prepare_adapter_input(layernorm_output)
+        projections = {}
+        for adapter_key in ("adapter_gate", "adapter_x"):
+            adapters = [slot[adapter_key] for slot in self.adapters]
+            projection = self._forward_adapter_group(x_flat, tokens_per_adapter, adapters)
+            projections[adapter_key] = self._finish_adapter_output(projection)
+
+        gate = projections["adapter_gate"]
+        x_projection = projections["adapter_x"]
+        trailing_features = linear_output.shape[-1] - gate.shape[-1] - x_projection.shape[-1]
+        if trailing_features < 0:
+            raise RuntimeError(
+                f"{self.base_linear_name}: adapter projections exceed packed in_proj output "
+                f"({gate.shape[-1]} + {x_projection.shape[-1]} > {linear_output.shape[-1]})"
+            )
+        untouched = linear_output.new_zeros(*gate.shape[:-1], trailing_features)
+        adapter_output = torch.cat((gate, x_projection, untouched), dim=-1)
+        return linear_output + adapter_output.reshape(linear_output.shape), bias
+
+
 @dataclass
 class ExpertSlotRouting:
     """Per-forward mapping from dispatched expert tokens to adapter slots.

@@ -71,6 +71,10 @@ class FakeMultiLoRALinearSplitQKV(FakeMultiLoRALinear):
     """Stand-in for the split-QKV multi-LoRA wrapper."""
 
 
+class FakeMultiLoRALinearSplitMambaInProj(FakeMultiLoRALinear):
+    """Stand-in for the split-Mamba in_proj multi-LoRA wrapper."""
+
+
 def multi_lora_linear_patch():
     """Patch both multi-LoRA layer types in the transform module with recording fakes.
 
@@ -81,6 +85,7 @@ def multi_lora_linear_patch():
     return patch.multiple(
         multi_lora_module,
         MultiLoRALinear=FakeMultiLoRALinear,
+        MultiLoRALinearSplitMambaInProj=FakeMultiLoRALinearSplitMambaInProj,
         MultiLoRALinearSplitQKV=FakeMultiLoRALinearSplitQKV,
         MultiLoRAGroupedExpertLinear=FakeMultiLoRAGroupedExpertLinear,
     )
@@ -128,6 +133,18 @@ class NestedModel(nn.Module):
                 for _ in range(2)
             ]
         )
+
+
+class MambaModel(nn.Module):
+    """Mamba mixer with packed in_proj and row-parallel-style out_proj names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList([nn.Module()])
+        self.decoder.layers[0].mixer = nn.Module()
+        self.decoder.layers[0].mixer.in_proj = nn.Linear(32, 96)
+        self.decoder.layers[0].mixer.out_proj = nn.Linear(64, 32)
 
 
 class _FakeGroupedExpertLinear(nn.Linear):
@@ -192,6 +209,7 @@ class TestMultiLoRAConfig:
         assert peft.a2a_experimental is False
         assert peft.lora_dtype is None
         assert peft.split_qkv is False
+        assert peft.split_mamba is False
 
     def test_custom_initialization(self) -> None:
         peft = MultiLoRA(
@@ -295,6 +313,22 @@ class TestMultiLoRATransform:
         transformed = peft(model, training=True)
 
         assert isinstance(transformed.linear_qkv, FakeMultiLoRALinearSplitQKV)
+
+    def test_transform_uses_split_mamba_in_proj_wrapper(self) -> None:
+        model = MambaModel()
+        peft = MultiLoRA(
+            target_modules=[
+                "decoder.layers.*.mixer.in_proj",
+                "decoder.layers.*.mixer.out_proj",
+            ],
+            split_mamba=True,
+        )
+
+        transformed = peft(model, training=True)
+
+        mixer = transformed.decoder.layers[0].mixer
+        assert isinstance(mixer.in_proj, FakeMultiLoRALinearSplitMambaInProj)
+        assert isinstance(mixer.out_proj, FakeMultiLoRALinear)
 
     def test_transform_nested_model(self) -> None:
         model = NestedModel()

@@ -52,6 +52,7 @@ from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import (
     MultiLoRALinear,
+    MultiLoRALinearSplitMambaInProj,
     MultiLoRALinearSplitQKV,
     _iter_multi_lora_modules,
     clear_adapter_slot,
@@ -153,6 +154,22 @@ def _build_split_qkv_multi_lora_linear(n_adapters: int = 2, dim: int = 8) -> Mul
         dim=dim,
         alpha=16,
         full_name="decoder.layers.0.self_attention.linear_qkv",
+    )
+
+
+def _build_split_mamba_multi_lora_linear(
+    n_adapters: int = 2,
+    dim: int = 8,
+) -> MultiLoRALinearSplitMambaInProj:
+    """Construct a split-Mamba in_proj wrapper for packed [z, x, B, C, dt]."""
+    base = nn.Linear(4, 24)
+    base.weight.partition_sizes = [8, 8, 2, 2, 4]
+    return MultiLoRALinearSplitMambaInProj(
+        to_wrap=base,
+        n_adapters=n_adapters,
+        dim=dim,
+        alpha=16,
+        full_name="decoder.layers.0.mixer.in_proj",
     )
 
 
@@ -375,6 +392,91 @@ class TestMultiLoRALinearSplitQKV:
         assert "adapter" not in layer._modules
         for adapter in layer.adapters[0].values():
             assert adapter.alpha == 16
+
+
+class TestMultiLoRALinearSplitMambaInProj:
+    """Independent Mamba gate/x slots and packed [z, x, B, C, dt] output."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_adapter_deps(self):
+        with adapter_deps_patch():
+            yield
+
+    def test_builds_gate_and_x_adapters_per_slot(self) -> None:
+        layer = _build_split_mamba_multi_lora_linear(n_adapters=3)
+
+        assert len(layer.adapters) == 3
+        for slot in layer.adapters:
+            assert set(slot) == {"adapter_gate", "adapter_x"}
+            assert slot["adapter_gate"].linear_out.out_features == 8
+            assert slot["adapter_x"].linear_out.out_features == 8
+
+    def test_derives_projection_size_from_mamba_heads(self) -> None:
+        base = nn.Linear(4, 24)
+        base.config = type("Config", (), {"mamba_num_heads": 4, "mamba_head_dim": 2})()
+
+        layer = MultiLoRALinearSplitMambaInProj(
+            to_wrap=base,
+            n_adapters=2,
+            dim=8,
+            alpha=16,
+            full_name="decoder.layers.0.mixer.in_proj",
+        )
+
+        assert layer.adapters[0]["adapter_gate"].linear_out.out_features == 8
+        assert layer.adapters[0]["adapter_x"].linear_out.out_features == 8
+
+    def test_rejects_in_proj_without_partition_metadata(self) -> None:
+        with pytest.raises(ValueError, match="five.*partition sizes"):
+            MultiLoRALinearSplitMambaInProj(
+                to_wrap=nn.Linear(4, 24),
+                n_adapters=2,
+                dim=8,
+                alpha=16,
+                full_name="decoder.layers.0.mixer.in_proj",
+            )
+
+    def test_rank_mask_applies_to_gate_and_x(self) -> None:
+        layer = _build_split_mamba_multi_lora_linear(dim=8)
+        with torch.no_grad():
+            for adapter in layer.adapters[0].values():
+                adapter.linear_in.weight.fill_(1)
+                adapter.linear_out.weight.fill_(1)
+
+        layer.init_adapter_slot(0, rank=4, alpha=16)
+
+        for adapter in layer.adapters[0].values():
+            assert torch.all(adapter.linear_in.weight[4:] == 0)
+            assert torch.all(adapter.linear_out.weight[:, 4:] == 0)
+
+    def test_forward_leaves_state_space_rows_unchanged(self) -> None:
+        layer = _build_split_mamba_multi_lora_linear()
+        gate = torch.full((1, 8), 2.0)
+        x_projection = torch.full((1, 8), 3.0)
+        x = torch.randn(1, 4)
+        counts = torch.tensor([1, 0], dtype=torch.int32)
+
+        with (
+            patch.object(layer, "base_linear_forward", return_value=(torch.zeros(1, 24), None, x)),
+            patch.object(layer, "_prepare_adapter_input", return_value=(x, counts)),
+            patch.object(layer, "_forward_adapter_group", side_effect=(gate, x_projection)),
+            patch.object(layer, "_finish_adapter_output", side_effect=lambda output: output),
+        ):
+            output, bias = layer(x)
+
+        assert bias is None
+        assert torch.equal(output[:, :8], gate)
+        assert torch.equal(output[:, 8:16], x_projection)
+        assert torch.count_nonzero(output[:, 16:]) == 0
+
+    def test_expose_slot_uses_gate_and_x_layout(self) -> None:
+        layer = _build_split_mamba_multi_lora_linear()
+        layer.init_adapter_slot(0, rank=4, alpha=12)
+
+        with expose_adapter_slot(layer, 0):
+            assert set(layer.adapter) == {"adapter_gate", "adapter_x"}
+            for adapter in layer.adapter.values():
+                assert adapter.alpha == pytest.approx(24)
 
 
 # ======================================================================

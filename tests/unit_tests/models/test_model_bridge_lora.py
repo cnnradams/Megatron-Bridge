@@ -714,6 +714,38 @@ def test_resolve_hf_adapter_param_name_without_weight_suffix():
     assert name == "model.layers.0.mlp.experts.gate_up_proj.lora_A.weight"
 
 
+@pytest.mark.parametrize(
+    ("adapter_key", "projection"),
+    [("adapter_gate", "gate_proj"), ("adapter_x", "x_proj")],
+)
+def test_resolve_split_mamba_in_proj_adapter_names(adapter_key, projection):
+    bridge = DummyBridge()
+    registry = MegatronMappingRegistry(
+        AutoMapping(
+            megatron_param="decoder.layers.*.mixer.in_proj.weight",
+            hf_param="backbone.layers.*.mixer.in_proj.weight",
+        )
+    )
+    prefix = "decoder.layers.0.mixer.in_proj"
+
+    name = bridge._resolve_hf_adapter_param_name(
+        registry,
+        prefix,
+        ".linear_in.weight",
+        ".weight",
+        adapter_key,
+    )
+    base_names = bridge._get_base_hf_param_names_for_adapter(
+        registry,
+        prefix,
+        adapter_key,
+        ".weight",
+    )
+
+    assert name == f"backbone.layers.0.mixer.{projection}.lora_A.weight"
+    assert base_names == [f"backbone.layers.0.mixer.{projection}.weight"]
+
+
 def test_build_adapter_conversion_tasks(monkeypatch):
     bridge = DummyBridge()
     bridge.hf_pretrained = SimpleNamespace()
