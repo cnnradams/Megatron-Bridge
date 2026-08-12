@@ -67,6 +67,10 @@ class FakeMultiLoRAGroupedExpertLinear(nn.Module):
         self.init_kwargs = kwargs
 
 
+class FakeMultiLoRALinearSplitQKV(FakeMultiLoRALinear):
+    """Stand-in for the split-QKV multi-LoRA wrapper."""
+
+
 def multi_lora_linear_patch():
     """Patch both multi-LoRA layer types in the transform module with recording fakes.
 
@@ -77,6 +81,7 @@ def multi_lora_linear_patch():
     return patch.multiple(
         multi_lora_module,
         MultiLoRALinear=FakeMultiLoRALinear,
+        MultiLoRALinearSplitQKV=FakeMultiLoRALinearSplitQKV,
         MultiLoRAGroupedExpertLinear=FakeMultiLoRAGroupedExpertLinear,
     )
 
@@ -186,6 +191,7 @@ class TestMultiLoRAConfig:
         assert peft.lora_B_init_method == "zero"
         assert peft.a2a_experimental is False
         assert peft.lora_dtype is None
+        assert peft.split_qkv is False
 
     def test_custom_initialization(self) -> None:
         peft = MultiLoRA(
@@ -281,6 +287,14 @@ class TestMultiLoRATransform:
         assert kwargs["a2a_experimental"] is True
         assert kwargs["full_name"] == "linear_qkv"
         assert transformed.linear_qkv.to_wrap is not None
+
+    def test_transform_uses_split_qkv_wrapper(self) -> None:
+        model = SimpleModel()
+        peft = MultiLoRA(target_modules=["linear_qkv"], split_qkv=True)
+
+        transformed = peft(model, training=True)
+
+        assert isinstance(transformed.linear_qkv, FakeMultiLoRALinearSplitQKV)
 
     def test_transform_nested_model(self) -> None:
         model = NestedModel()

@@ -969,6 +969,34 @@ class TestCanonicalLoRAHelperClasses:
 
         assert torch.equal(output, expected)
 
+    def test_lora_linear_split_qkv_interleaves_tp_local_outputs(self):
+        """Global config head counts must not be used to reshape TP-local adapter outputs."""
+
+        class MockConfig:
+            kv_channels = 4
+            num_query_groups = 4
+            num_attention_heads = 8
+
+        base_layer = nn.Linear(4, 4)
+        base_layer.config = MockConfig()
+        adapters = ModuleDict({"adapter_q": nn.Identity(), "adapter_k": nn.Identity(), "adapter_v": nn.Identity()})
+        wrapper = LoRALinearSplitQKV(base_layer, adapters)
+
+        q_heads = [torch.full((4,), i + 1, dtype=torch.float32) for i in range(4)]
+        k_heads = [torch.full((4,), 10 + i, dtype=torch.float32) for i in range(2)]
+        v_heads = [torch.full((4,), 20 + i, dtype=torch.float32) for i in range(2)]
+
+        output = wrapper._interleave_qkv(
+            torch.cat(q_heads).reshape(1, 1, -1),
+            torch.cat(k_heads).reshape(1, 1, -1),
+            torch.cat(v_heads).reshape(1, 1, -1),
+        )
+        expected = torch.cat(
+            [q_heads[0], q_heads[1], k_heads[0], v_heads[0], q_heads[2], q_heads[3], k_heads[1], v_heads[1]]
+        ).reshape(1, 1, -1)
+
+        assert torch.equal(output, expected)
+
     def test_lora_linear_split_qkv_infers_head_size_from_hidden_size(self):
         """Test LoRALinearSplitQKV infers head size when kv_channels is missing."""
 

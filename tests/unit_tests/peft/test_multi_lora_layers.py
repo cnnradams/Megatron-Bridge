@@ -52,6 +52,7 @@ from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
 from megatron.bridge.peft.multi_lora import MultiLoRA
 from megatron.bridge.peft.multi_lora_layers import (
     MultiLoRALinear,
+    MultiLoRALinearSplitQKV,
     _iter_multi_lora_modules,
     clear_adapter_slot,
     expose_adapter_slot,
@@ -135,6 +136,23 @@ def _build_multi_lora_linear(
         dim=dim,
         alpha=alpha,
         full_name=full_name,
+    )
+
+
+def _build_split_qkv_multi_lora_linear(n_adapters: int = 2, dim: int = 8) -> MultiLoRALinearSplitQKV:
+    """Construct a split-QKV multi-LoRA layer with a small GQA configuration."""
+    base = nn.Linear(4, 32)
+    base.config = type(
+        "Config",
+        (),
+        {"kv_channels": 4, "num_attention_heads": 4, "num_query_groups": 2},
+    )()
+    return MultiLoRALinearSplitQKV(
+        to_wrap=base,
+        n_adapters=n_adapters,
+        dim=dim,
+        alpha=16,
+        full_name="decoder.layers.0.self_attention.linear_qkv",
     )
 
 
@@ -285,6 +303,78 @@ class TestMultiLoRALinearSlots:
             entry = sharded_sd[f"decoder.layers.0.linear_proj.adapters.{i}.linear_out.weight"]
             assert entry[0] == "sharded"
             assert entry[1] is layer.adapters[i].linear_out.weight
+
+
+class TestMultiLoRALinearSplitQKV:
+    """Independent Q/K/V slot layout, lifecycle, and packed forward output."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_adapter_deps(self):
+        with adapter_deps_patch():
+            yield
+
+    def test_builds_three_adapters_per_slot(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear(n_adapters=3)
+
+        assert len(layer.adapters) == 3
+        for slot in layer.adapters:
+            assert set(slot) == {"adapter_q", "adapter_k", "adapter_v"}
+            assert slot["adapter_q"].linear_out.out_features == 16
+            assert slot["adapter_k"].linear_out.out_features == 8
+            assert slot["adapter_v"].linear_out.out_features == 8
+
+    def test_rank_mask_applies_to_every_projection(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear(dim=8)
+        with torch.no_grad():
+            for adapter in layer.adapters[0].values():
+                adapter.linear_in.weight.fill_(1)
+                adapter.linear_out.weight.fill_(1)
+
+        layer.init_adapter_slot(0, rank=4, alpha=16)
+
+        for adapter in layer.adapters[0].values():
+            assert torch.all(adapter.linear_in.weight[4:] == 0)
+            assert torch.all(adapter.linear_out.weight[:, 4:] == 0)
+
+    def test_forward_interleaves_gqa_projections(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear()
+        q_heads = [torch.full((4,), i + 1, dtype=torch.float32) for i in range(4)]
+        k_heads = [torch.full((4,), 10 + i, dtype=torch.float32) for i in range(2)]
+        v_heads = [torch.full((4,), 20 + i, dtype=torch.float32) for i in range(2)]
+        projections = [
+            torch.cat(q_heads).reshape(1, -1),
+            torch.cat(k_heads).reshape(1, -1),
+            torch.cat(v_heads).reshape(1, -1),
+        ]
+        x = torch.randn(1, 4)
+        counts = torch.tensor([1, 0], dtype=torch.int32)
+
+        with (
+            patch.object(layer, "base_linear_forward", return_value=(torch.zeros(1, 32), None, x)),
+            patch.object(layer, "_prepare_adapter_input", return_value=(x, counts)),
+            patch.object(layer, "_forward_adapter_group", side_effect=projections),
+            patch.object(layer, "_finish_adapter_output", side_effect=lambda output: output),
+        ):
+            output, bias = layer(x)
+
+        expected = torch.cat(
+            [q_heads[0], q_heads[1], k_heads[0], v_heads[0], q_heads[2], q_heads[3], k_heads[1], v_heads[1]]
+        ).reshape(1, -1)
+        assert bias is None
+        assert torch.equal(output, expected)
+
+    def test_expose_slot_uses_canonical_adapter_layout_and_scaling(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear()
+        layer.init_adapter_slot(0, rank=4, alpha=12)
+
+        with expose_adapter_slot(layer, 0):
+            assert set(layer.adapter) == {"adapter_q", "adapter_k", "adapter_v"}
+            for adapter in layer.adapter.values():
+                assert adapter.alpha == pytest.approx(24)
+
+        assert "adapter" not in layer._modules
+        for adapter in layer.adapters[0].values():
+            assert adapter.alpha == 16
 
 
 # ======================================================================
@@ -885,9 +975,7 @@ class TestMultiLoRALinearGPU:
             return mlora.to_wrap(x)[0] + torch.cat(rows, dim=0)
 
         for counts in ([3, 5], [6, 2], [0, 4]):
-            set_tokens_per_adapter_slot(
-                [mlora], torch.tensor(counts, dtype=torch.int32, device="cuda")
-            )
+            set_tokens_per_adapter_slot([mlora], torch.tensor(counts, dtype=torch.int32, device="cuda"))
             x = torch.randn(sum(counts), 16, dtype=torch.bfloat16, device="cuda")
             out, _ = mlora(x)
             torch.testing.assert_close(out, reference(x, counts))

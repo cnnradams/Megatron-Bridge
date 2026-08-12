@@ -40,6 +40,67 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _interleave_qkv_outputs(
+    wrapped_module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Interleave separate Q, K, and V outputs into Megatron's packed ordering."""
+    config = wrapped_module.config
+    head_num = getattr(config, "num_attention_heads", None)
+    num_query_groups = getattr(config, "num_query_groups", None)
+    head_size = getattr(config, "kv_channels", None)
+
+    if head_size is None:
+        hidden_size = getattr(config, "hidden_size", None)
+        if head_num is not None and hidden_size is not None:
+            head_size = hidden_size // head_num
+        elif num_query_groups:
+            if key.size(-1) % num_query_groups != 0:
+                raise ValueError("Key projection size must be divisible by num_query_groups.")
+            head_size = key.size(-1) // num_query_groups
+        elif head_num is not None:
+            if query.size(-1) % head_num != 0:
+                raise ValueError("Query projection size must be divisible by num_attention_heads.")
+            head_size = query.size(-1) // head_num
+        else:
+            raise ValueError(
+                "Cannot infer head size without kv_channels or hidden_size/num_attention_heads or num_query_groups."
+            )
+
+    if query.size(-1) % head_size != 0:
+        raise ValueError("Query projection size must be divisible by head_size.")
+    if key.size(-1) % head_size != 0:
+        raise ValueError("Key projection size must be divisible by head_size.")
+    if value.size(-1) != key.size(-1):
+        raise ValueError("Key and value projection sizes must match.")
+
+    # Adapter outputs are TP-local for a column-parallel linear_qkv. Derive the
+    # local head/group counts from those outputs rather than reshaping with the
+    # global counts stored in the TransformerConfig.
+    head_num = query.size(-1) // head_size
+    num_query_groups = key.size(-1) // head_size
+    if head_num % num_query_groups != 0:
+        raise ValueError("num_attention_heads must be divisible by num_query_groups.")
+
+    heads_per_group = head_num // num_query_groups
+    leading_shape = query.shape[:-1]
+    query = query.reshape(-1, head_num, head_size)
+    key = key.reshape(-1, num_query_groups, head_size)
+    value = value.reshape(-1, num_query_groups, head_size)
+
+    qkv_chunks = []
+    for i in range(num_query_groups):
+        q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
+        k_group = key[:, i : i + 1, :]
+        v_group = value[:, i : i + 1, :]
+        qkv_chunks.extend([q_group, k_group, v_group])
+
+    qkv = torch.cat(qkv_chunks, dim=1)
+    return qkv.reshape(*leading_shape, -1)
+
+
 def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
     """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter."""
 
@@ -89,58 +150,7 @@ class LoRALinearSplitQKV(AdapterWrapper):
 
     def _interleave_qkv(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Interleave QKV outputs to match Megatron's packed ordering."""
-
-        config = self.to_wrap.config
-        head_num = getattr(config, "num_attention_heads", None)
-        num_query_groups = getattr(config, "num_query_groups", None)
-        head_size = getattr(config, "kv_channels", None)
-
-        if head_size is None:
-            hidden_size = getattr(config, "hidden_size", None)
-            if head_num is not None and hidden_size is not None:
-                head_size = hidden_size // head_num
-            elif num_query_groups:
-                if key.size(-1) % num_query_groups != 0:
-                    raise ValueError("Key projection size must be divisible by num_query_groups.")
-                head_size = key.size(-1) // num_query_groups
-            elif head_num is not None:
-                if query.size(-1) % head_num != 0:
-                    raise ValueError("Query projection size must be divisible by num_attention_heads.")
-                head_size = query.size(-1) // head_num
-            else:
-                raise ValueError(
-                    "Cannot infer head size without kv_channels or hidden_size/num_attention_heads or num_query_groups."
-                )
-
-        if head_num is None:
-            if query.size(-1) % head_size != 0:
-                raise ValueError("Query projection size must be divisible by head_size.")
-            head_num = query.size(-1) // head_size
-
-        if not num_query_groups:
-            if key.size(-1) % head_size != 0:
-                raise ValueError("Key projection size must be divisible by head_size.")
-            num_query_groups = key.size(-1) // head_size
-
-        if head_num % num_query_groups != 0:
-            raise ValueError("num_attention_heads must be divisible by num_query_groups.")
-
-        heads_per_group = head_num // num_query_groups
-
-        leading_shape = query.shape[:-1]
-        query = query.reshape(-1, head_num, head_size)
-        key = key.reshape(-1, num_query_groups, head_size)
-        value = value.reshape(-1, num_query_groups, head_size)
-
-        qkv_chunks = []
-        for i in range(num_query_groups):
-            q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
-            k_group = key[:, i : i + 1, :]
-            v_group = value[:, i : i + 1, :]
-            qkv_chunks.extend([q_group, k_group, v_group])
-
-        qkv = torch.cat(qkv_chunks, dim=1)
-        return qkv.reshape(*leading_shape, -1)
+        return _interleave_qkv_outputs(self.to_wrap, query, key, value)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # pylint: disable=C0115,C0116
