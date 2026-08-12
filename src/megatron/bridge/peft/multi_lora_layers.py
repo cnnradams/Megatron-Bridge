@@ -47,7 +47,9 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
+from megatron.bridge.peft.canonical_lora import ModuleDict, _interleave_qkv_outputs
 from megatron.bridge.peft.utils import (
+    AdapterAttributes,
     GroupedExpertLinearAdapter,
     ParallelLinearAdapter,
     all2all_hp2sp,
@@ -96,6 +98,8 @@ class MultiLoRALinear(AdapterWrapper):
         # init methods instead of hardcoding xavier/zero.
         self._column_init_method = column_init_method
         self._row_init_method = row_init_method
+        self._default_alpha = alpha
+        self._dropout_position = dropout_position
 
         attrs = get_adapter_attributes_from_linear(to_wrap)
 
@@ -120,29 +124,7 @@ class MultiLoRALinear(AdapterWrapper):
         # ModuleList of ParallelLinearAdapters gives per-adapter optimizer state
         # isolation, clean checkpoint serialization, and bridge export compatibility.
         # Adapter kwargs mirror the single-LoRA path (LoRA.transform).
-        self.adapters = nn.ModuleList(
-            [
-                ParallelLinearAdapter(
-                    in_features=attrs.in_features,
-                    out_features=attrs.out_features,
-                    dim=dim,
-                    base_linear_name=full_name,
-                    activation="identity",
-                    alpha=alpha,
-                    input_is_parallel=attrs.input_is_parallel,
-                    column_init_method=column_init_method,
-                    row_init_method=row_init_method,
-                    model_parallel_config=getattr(to_wrap, "config", None),
-                    disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
-                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
-                    base_linear_is_parallel=attrs.base_linear_is_parallel,
-                    a2a_experimental=a2a_experimental,
-                    dropout=dropout,
-                    dropout_position=dropout_position,
-                )
-                for _ in range(n_adapters)
-            ]
-        )
+        self.adapters = nn.ModuleList([self._build_adapter_slot(attrs) for _ in range(n_adapters)])
 
         self.tokens_per_adapter: Optional[torch.Tensor] = None
         # Host-side sum of tokens_per_adapter (set alongside it); lets forward
@@ -156,13 +138,43 @@ class MultiLoRALinear(AdapterWrapper):
             "rank_values", torch.full((n_adapters,), dim, dtype=dtype, device=device), persistent=False
         )
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+    def _build_adapter(self, attrs: AdapterAttributes, out_features: int) -> ParallelLinearAdapter:
+        """Build one parallel adapter using the wrapped linear's communication layout."""
+        return ParallelLinearAdapter(
+            in_features=attrs.in_features,
+            out_features=out_features,
+            dim=self.max_rank,
+            base_linear_name=self.base_linear_name,
+            activation="identity",
+            alpha=self._default_alpha,
+            input_is_parallel=attrs.input_is_parallel,
+            column_init_method=self._column_init_method,
+            row_init_method=self._row_init_method,
+            model_parallel_config=getattr(self.to_wrap, "config", None),
+            disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
+            disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
+            base_linear_is_parallel=attrs.base_linear_is_parallel,
+            a2a_experimental=self.use_a2a,
+            dropout=0.0,
+            dropout_position=self._dropout_position,
+        )
 
-        if not self._adapter_enabled:
-            return linear_output, bias
+    def _build_adapter_slot(self, attrs: AdapterAttributes) -> nn.Module:
+        """Build the adapter module stored for one slot."""
+        return self._build_adapter(attrs, attrs.out_features)
 
+    def _slot_adapters(self, idx: int) -> Tuple[ParallelLinearAdapter, ...]:
+        """Return all low-rank pairs owned by one slot."""
+        return (self.adapters[idx],)
+
+    def _prepare_adapter_input(self, layernorm_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Flatten the adapter input and align slot counts with its local token window."""
         tokens_per_adapter = self.tokens_per_adapter
+        if tokens_per_adapter is None:
+            raise RuntimeError(
+                "set_tokens_per_adapter_slot(model, adapter_token_counts) must run before every "
+                f"forward through {self.base_linear_name}."
+            )
         x = layernorm_output.contiguous()
 
         # SP gather (once) — for column-parallel base layers without an LN-fused
@@ -176,8 +188,6 @@ class MultiLoRALinear(AdapterWrapper):
         # A replicated base (e.g. MLA q/kv down-projections) does no SP gather —
         # under sequence parallelism it consumes the SP shard directly, so the
         # per-slot spans must be narrowed to this rank's contiguous token window.
-        # The shard is contiguous in the same sequence-major flattening the spans
-        # address (same invariant as the MoE slot routing's SP narrow).
         total = self.tokens_per_adapter_total
         if total is not None and x_flat.shape[0] != total:
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -191,42 +201,33 @@ class MultiLoRALinear(AdapterWrapper):
             start = parallel_state.get_tensor_model_parallel_rank() * x_flat.shape[0]
             tokens_per_adapter = _narrow_token_counts_to_window(tokens_per_adapter, start, x_flat.shape[0])
 
-        offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
+        return x_flat, tokens_per_adapter
 
-        stacked_A = torch.stack([a.linear_in.weight for a in self.adapters])
-        stacked_B = torch.stack([a.linear_out.weight for a in self.adapters])
+    def _forward_adapter_group(
+        self,
+        x_flat: torch.Tensor,
+        tokens_per_adapter: torch.Tensor,
+        adapters: Sequence[ParallelLinearAdapter],
+    ) -> torch.Tensor:
+        """Run one logical projection across every adapter slot."""
+        offsets = tokens_per_adapter.cumsum(dim=0, dtype=torch.int32)
+        stacked_A = torch.stack([adapter.linear_in.weight for adapter in adapters])
+        stacked_B = torch.stack([adapter.linear_out.weight for adapter in adapters])
 
         mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
 
-        # TP collective between A and B: row-parallel base needs an all-reduce
-        # of the partial sums; every other base (column-parallel and replicated
-        # alike — ParallelLinearAdapter shards A on the rank axis whenever
-        # input_is_parallel is False) needs an all-gather of the rank-sharded
-        # mid to a full [tokens, dim] for the second GEMM.
         if self.input_is_parallel:
             mid = reduce_from_tensor_model_parallel_region(mid)
         else:
             mid = gather_from_tensor_model_parallel_region(mid)
 
         out = torch._grouped_mm(mid, stacked_B.transpose(-2, -1), offsets)
-
-        # Per-token scaling is applied *before* the output-side TP/SP comms.
-        # ``per_token_scaling`` is indexed by the full token count
-        # (``tokens_per_adapter`` sums to it); doing it after a sequence-parallel
-        # scatter would leave ``out`` with ``tokens/tp`` rows and crash here.
-        # The ratio is computed and applied in the activation dtype: a ratio not
-        # exactly representable there (e.g. alpha/rank = 32/24 in bf16) is
-        # rounded, while the rollout engine (sglang) multiplies the exact fp32
-        # ratio into an fp32 accumulator. Where train/rollout parity at that
-        # level matters, keep alpha/rank ratios exactly representable; closing
-        # the gap entirely would require applying the scaling in fp32.
         scaling = self.alpha_values / self.rank_values
         per_token_scaling = torch.repeat_interleave(scaling, tokens_per_adapter).unsqueeze(-1)
-        out = out * per_token_scaling
+        return out * per_token_scaling
 
-        # Match the wrapped base linear's output layout: row-parallel base
-        # produces a fully-summed [tokens, h_out] tensor (which we then SP
-        # scatter); column-parallel base keeps the [tokens, h_out/tp] shard.
+    def _finish_adapter_output(self, out: torch.Tensor) -> torch.Tensor:
+        """Match the wrapped base linear's tensor- and sequence-parallel output layout."""
         if self._gather_output:
             out = gather_from_tensor_model_parallel_region(out)
 
@@ -235,7 +236,17 @@ class MultiLoRALinear(AdapterWrapper):
                 out = all2all_hp2sp(out)
             else:
                 out = scatter_to_sequence_parallel_region(out)
+        return out
 
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        x_flat, tokens_per_adapter = self._prepare_adapter_input(layernorm_output)
+        out = self._forward_adapter_group(x_flat, tokens_per_adapter, self.adapters)
+        out = self._finish_adapter_output(out)
         return linear_output + out.reshape(linear_output.shape), bias
 
     def reset_adapter(self, idx: int) -> None:
@@ -248,12 +259,12 @@ class MultiLoRALinear(AdapterWrapper):
 
         from megatron.bridge.peft.utils import ParallelLinearAdapter
 
-        adapter = self.adapters[idx]
         col_fn = ParallelLinearAdapter._get_init_fn(None, self._column_init_method)
         row_fn = ParallelLinearAdapter._get_init_fn(None, self._row_init_method)
         with get_cuda_rng_tracker().fork():
-            col_fn(adapter.linear_in.weight.data)
-            row_fn(adapter.linear_out.weight.data)
+            for adapter in self._slot_adapters(idx):
+                col_fn(adapter.linear_in.weight.data)
+                row_fn(adapter.linear_out.weight.data)
 
     def init_adapter_slot(self, idx: int, rank: int, alpha: float) -> None:
         """Claim slot ``idx`` for an adapter: bind ``rank``/``alpha`` and apply the rank mask."""
@@ -284,18 +295,18 @@ class MultiLoRALinear(AdapterWrapper):
         actual_rank = int(self.rank_values[idx].item())
         if actual_rank >= self.max_rank:
             return
-        adapter = self.adapters[idx]
-        local_rank_dim = adapter.linear_in.weight.shape[0]
-        if local_rank_dim < self.max_rank:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            shard_start = tp_rank * local_rank_dim
-            local_start = max(0, actual_rank - shard_start)
-        else:
-            local_start = actual_rank
         with torch.no_grad():
-            if local_start < local_rank_dim:
-                adapter.linear_in.weight.data[local_start:].zero_()
-            adapter.linear_out.weight.data[:, actual_rank:].zero_()
+            for adapter in self._slot_adapters(idx):
+                local_rank_dim = adapter.linear_in.weight.shape[0]
+                if local_rank_dim < self.max_rank:
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    shard_start = tp_rank * local_rank_dim
+                    local_start = max(0, actual_rank - shard_start)
+                else:
+                    local_start = actual_rank
+                if local_start < local_rank_dim:
+                    adapter.linear_in.weight.data[local_start:].zero_()
+                adapter.linear_out.weight.data[:, actual_rank:].zero_()
 
     def state_dict(
         self,
@@ -320,6 +331,52 @@ class MultiLoRALinear(AdapterWrapper):
         for i, adapter in enumerate(self.adapters):
             sharded_sd.update(adapter.sharded_state_dict(f"{prefix}adapters.{i}.", sharded_offsets, metadata))
         return sharded_sd
+
+
+class MultiLoRALinearSplitQKV(MultiLoRALinear):
+    """Multi-slot LoRA wrapper with independent Q, K, and V adapters per slot.
+
+    The wrapped Megatron projection remains a fused ``linear_qkv``. Each slot
+    stores three low-rank pairs and the forward interleaves their outputs into
+    Megatron's packed GQA ordering before adding the fused base result.
+    """
+
+    def _build_adapter_slot(self, attrs: AdapterAttributes) -> ModuleDict:
+        config = self.to_wrap.config
+        head_size = config.kv_channels
+        q_out_features = head_size * config.num_attention_heads
+        kv_out_features = head_size * config.num_query_groups
+        return ModuleDict(
+            {
+                "adapter_q": self._build_adapter(attrs, q_out_features),
+                "adapter_k": self._build_adapter(attrs, kv_out_features),
+                "adapter_v": self._build_adapter(attrs, kv_out_features),
+            }
+        )
+
+    def _slot_adapters(self, idx: int) -> Tuple[ParallelLinearAdapter, ...]:
+        slot = self.adapters[idx]
+        return tuple(slot.values())
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        x_flat, tokens_per_adapter = self._prepare_adapter_input(layernorm_output)
+        projections = {}
+        for adapter_key in ("adapter_q", "adapter_k", "adapter_v"):
+            adapters = [slot[adapter_key] for slot in self.adapters]
+            projection = self._forward_adapter_group(x_flat, tokens_per_adapter, adapters)
+            projections[adapter_key] = self._finish_adapter_output(projection)
+
+        adapter_output = _interleave_qkv_outputs(
+            self.to_wrap,
+            projections["adapter_q"],
+            projections["adapter_k"],
+            projections["adapter_v"],
+        )
+        return linear_output + adapter_output.reshape(linear_output.shape), bias
 
 
 @dataclass
@@ -626,13 +683,10 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
     """
     if tokens_per_adapter.dim() != 1:
         raise ValueError(
-            f"tokens_per_adapter must be a 1-D tensor of per-slot counts; "
-            f"got shape {tuple(tokens_per_adapter.shape)}"
+            f"tokens_per_adapter must be a 1-D tensor of per-slot counts; got shape {tuple(tokens_per_adapter.shape)}"
         )
     if tokens_per_adapter.is_floating_point() or tokens_per_adapter.is_complex():
-        raise ValueError(
-            f"tokens_per_adapter must be an integer tensor; got dtype {tokens_per_adapter.dtype}"
-        )
+        raise ValueError(f"tokens_per_adapter must be an integer tensor; got dtype {tokens_per_adapter.dtype}")
     # One host sync per micro-batch (the tolist doubles as the sync the SP-shard
     # narrowing needs): layers whose base linear consumes the SP-sharded sequence
     # compare their row count against this total to narrow the spans to their
@@ -649,8 +703,7 @@ def set_tokens_per_adapter_slot(model, tokens_per_adapter: torch.Tensor) -> None
         n_adapters = modules[0].n_adapters
         if len(counts) != n_adapters:
             raise ValueError(
-                f"tokens_per_adapter has {len(counts)} entries but the model was "
-                f"built with n_adapters={n_adapters}"
+                f"tokens_per_adapter has {len(counts)} entries but the model was built with n_adapters={n_adapters}"
             )
         # The dense grouped GEMM consumes the counts on the model's device; the
         # MoE routing already moves them defensively — do it once here for both.
@@ -970,8 +1023,14 @@ def expose_adapter_slot(model, idx: int):
             if "adapters" in m._modules:
                 saved[id(m)] = m._modules.pop("adapters")
                 adapter = saved[id(m)][idx]
-                saved_alphas[id(m)] = adapter.alpha
-                adapter.alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.rank_values[idx])
+                export_alpha = float(m.alpha_values[idx]) * m.max_rank / float(m.rank_values[idx])
+                if isinstance(adapter, nn.ModuleDict):
+                    saved_alphas[id(m)] = {key: component.alpha for key, component in adapter.items()}
+                    for component in adapter.values():
+                        component.alpha = export_alpha
+                else:
+                    saved_alphas[id(m)] = adapter.alpha
+                    adapter.alpha = export_alpha
                 m.adapter = adapter
 
         # try/finally: an exception in the body (e.g. an export/save error, which
@@ -986,7 +1045,12 @@ def expose_adapter_slot(model, idx: int):
                     if "adapter" in m._modules:
                         del m._modules["adapter"]
                     m._modules["adapters"] = saved[id(m)]
-                    saved[id(m)][idx].alpha = saved_alphas[id(m)]
+                    adapter = saved[id(m)][idx]
+                    if isinstance(adapter, nn.ModuleDict):
+                        for key, alpha in saved_alphas[id(m)].items():
+                            adapter[key].alpha = alpha
+                    else:
+                        adapter.alpha = saved_alphas[id(m)]
 
     return _ctx()
 
