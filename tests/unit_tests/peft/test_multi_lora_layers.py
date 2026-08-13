@@ -481,7 +481,7 @@ class TestMultiLoRALinearSplitQKV:
             ),
             patch.object(
                 canonical_lora_module,
-                "gather_from_tensor_model_parallel_region",
+                "all_gather_last_dim_from_tensor_parallel_region",
                 return_value=gathered,
             ),
             patch.object(

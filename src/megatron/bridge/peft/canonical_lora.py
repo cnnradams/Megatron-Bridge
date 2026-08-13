@@ -19,7 +19,9 @@ from typing import Any, List, Literal, Optional, Tuple
 import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from torch import nn
 
@@ -48,7 +50,9 @@ def _gather_qkv_projections(
     value: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sizes = (query.size(-1), key.size(-1), value.size(-1))
-    gathered = gather_from_tensor_model_parallel_region(torch.cat((query, key, value), dim=-1))
+    gathered = all_gather_last_dim_from_tensor_parallel_region(
+        torch.cat((query, key, value), dim=-1)
+    )
     world_size = parallel_state.get_tensor_model_parallel_world_size()
     gathered = gathered.reshape(*query.shape[:-1], world_size, sum(sizes))
     offsets = (0, sizes[0], sizes[0] + sizes[1])
