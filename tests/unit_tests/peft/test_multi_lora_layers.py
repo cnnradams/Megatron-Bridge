@@ -139,13 +139,22 @@ def _build_multi_lora_linear(
     )
 
 
-def _build_split_qkv_multi_lora_linear(n_adapters: int = 2, dim: int = 8) -> MultiLoRALinearSplitQKV:
+def _build_split_qkv_multi_lora_linear(
+    n_adapters: int = 2,
+    dim: int = 8,
+    attention_output_gate: bool = False,
+) -> MultiLoRALinearSplitQKV:
     """Construct a split-QKV multi-LoRA layer with a small GQA configuration."""
-    base = nn.Linear(4, 32)
+    base = nn.Linear(4, 48 if attention_output_gate else 32)
     base.config = type(
         "Config",
         (),
-        {"kv_channels": 4, "num_attention_heads": 4, "num_query_groups": 2},
+        {
+            "kv_channels": 4,
+            "num_attention_heads": 4,
+            "num_query_groups": 2,
+            "attention_output_gate": attention_output_gate,
+        },
     )()
     return MultiLoRALinearSplitQKV(
         to_wrap=base,
@@ -323,6 +332,14 @@ class TestMultiLoRALinearSplitQKV:
             assert slot["adapter_k"].linear_out.out_features == 8
             assert slot["adapter_v"].linear_out.out_features == 8
 
+    def test_output_gate_is_part_of_query_adapter(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear(attention_output_gate=True)
+
+        for slot in layer.adapters:
+            assert slot["adapter_q"].linear_out.out_features == 32
+            assert slot["adapter_k"].linear_out.out_features == 8
+            assert slot["adapter_v"].linear_out.out_features == 8
+
     def test_rank_mask_applies_to_every_projection(self) -> None:
         layer = _build_split_qkv_multi_lora_linear(dim=8)
         with torch.no_grad():
@@ -359,6 +376,53 @@ class TestMultiLoRALinearSplitQKV:
 
         expected = torch.cat(
             [q_heads[0], q_heads[1], k_heads[0], v_heads[0], q_heads[2], q_heads[3], k_heads[1], v_heads[1]]
+        ).reshape(1, -1)
+        assert bias is None
+        assert torch.equal(output, expected)
+
+    def test_forward_interleaves_attention_output_gate(self) -> None:
+        layer = _build_split_qkv_multi_lora_linear(attention_output_gate=True)
+        q_heads = [torch.full((4,), i + 1, dtype=torch.float32) for i in range(4)]
+        gate_heads = [torch.full((4,), i + 5, dtype=torch.float32) for i in range(4)]
+        k_heads = [torch.full((4,), 10 + i, dtype=torch.float32) for i in range(2)]
+        v_heads = [torch.full((4,), 20 + i, dtype=torch.float32) for i in range(2)]
+        projections = [
+            torch.cat(
+                [
+                    projection
+                    for pair in zip(q_heads, gate_heads, strict=True)
+                    for projection in pair
+                ]
+            ).reshape(1, -1),
+            torch.cat(k_heads).reshape(1, -1),
+            torch.cat(v_heads).reshape(1, -1),
+        ]
+        x = torch.randn(1, 4)
+        counts = torch.tensor([1, 0], dtype=torch.int32)
+
+        with (
+            patch.object(layer, "base_linear_forward", return_value=(torch.zeros(1, 48), None, x)),
+            patch.object(layer, "_prepare_adapter_input", return_value=(x, counts)),
+            patch.object(layer, "_forward_adapter_group", side_effect=projections),
+            patch.object(layer, "_finish_adapter_output", side_effect=lambda output: output),
+        ):
+            output, bias = layer(x)
+
+        expected = torch.cat(
+            [
+                q_heads[0],
+                q_heads[1],
+                gate_heads[0],
+                gate_heads[1],
+                k_heads[0],
+                v_heads[0],
+                q_heads[2],
+                q_heads[3],
+                gate_heads[2],
+                gate_heads[3],
+                k_heads[1],
+                v_heads[1],
+            ]
         ).reshape(1, -1)
         assert bias is None
         assert torch.equal(output, expected)

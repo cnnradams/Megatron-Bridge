@@ -79,14 +79,20 @@ def _interleave_qkv_outputs(
     # Adapter outputs are TP-local for a column-parallel linear_qkv. Derive the
     # local head/group counts from those outputs rather than reshaping with the
     # global counts stored in the TransformerConfig.
-    head_num = query.size(-1) // head_size
+    gated = getattr(config, "attention_output_gate", False)
+    query_head_size = head_size * (2 if gated else 1)
+    if query.size(-1) % query_head_size != 0:
+        raise ValueError("Query projection size must be divisible by query_head_size.")
+    head_num = query.size(-1) // query_head_size
     num_query_groups = key.size(-1) // head_size
     if head_num % num_query_groups != 0:
         raise ValueError("num_attention_heads must be divisible by num_query_groups.")
 
     heads_per_group = head_num // num_query_groups
     leading_shape = query.shape[:-1]
-    query = query.reshape(-1, head_num, head_size)
+    query = query.reshape(-1, head_num, query_head_size)
+    if gated:
+        query, gate = torch.chunk(query, 2, dim=-1)
     key = key.reshape(-1, num_query_groups, head_size)
     value = value.reshape(-1, num_query_groups, head_size)
 
@@ -95,7 +101,12 @@ def _interleave_qkv_outputs(
         q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
         k_group = key[:, i : i + 1, :]
         v_group = value[:, i : i + 1, :]
-        qkv_chunks.extend([q_group, k_group, v_group])
+        qkv_chunks.append(q_group)
+        if gated:
+            qkv_chunks.append(
+                gate[:, i * heads_per_group : (i + 1) * heads_per_group, :]
+            )
+        qkv_chunks.extend([k_group, v_group])
 
     qkv = torch.cat(qkv_chunks, dim=1)
     return qkv.reshape(*leading_shape, -1)

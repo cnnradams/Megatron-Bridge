@@ -344,7 +344,11 @@ class MultiLoRALinearSplitQKV(MultiLoRALinear):
     def _build_adapter_slot(self, attrs: AdapterAttributes) -> ModuleDict:
         config = self.to_wrap.config
         head_size = config.kv_channels
-        q_out_features = head_size * config.num_attention_heads
+        q_out_features = (
+            head_size
+            * config.num_attention_heads
+            * (2 if getattr(config, "attention_output_gate", False) else 1)
+        )
         kv_out_features = head_size * config.num_query_groups
         return ModuleDict(
             {
