@@ -57,6 +57,27 @@ from megatron.bridge.peft.utils import (
 )
 
 
+class _AlignedGroupedMMGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> torch.Tensor:
+        alignment = 16 // gradient.element_size()
+        if gradient.stride(-1) == 1 and gradient.stride(-2) % alignment == 0:
+            return gradient
+        row_stride = (
+            (gradient.size(-1) + alignment - 1) // alignment * alignment
+        )
+        return torch.empty_strided(
+            gradient.shape,
+            (row_stride, 1),
+            dtype=gradient.dtype,
+            device=gradient.device,
+        ).copy_(gradient)
+
+
 class MultiLoRALinear(AdapterWrapper):
     """Megatron parallel linear wrapped with *N* concurrent LoRA adapters.
 
@@ -215,6 +236,7 @@ class MultiLoRALinear(AdapterWrapper):
         stacked_B = torch.stack([adapter.linear_out.weight for adapter in adapters])
 
         mid = torch._grouped_mm(x_flat, stacked_A.transpose(-2, -1), offsets)
+        mid = _AlignedGroupedMMGradient.apply(mid)
 
         if self.input_is_parallel:
             mid = reduce_from_tensor_model_parallel_region(mid)

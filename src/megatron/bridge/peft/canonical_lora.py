@@ -143,7 +143,7 @@ def _interleave_qkv_outputs(
     if gather_projections:
         rank = parallel_state.get_tensor_model_parallel_rank()
         local_size = qkv.size(-1) // world_size
-        qkv = qkv[..., rank * local_size : (rank + 1) * local_size]
+        qkv = qkv[..., rank * local_size : (rank + 1) * local_size].contiguous()
     return qkv
 
 

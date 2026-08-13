@@ -166,6 +166,18 @@ def _build_split_qkv_multi_lora_linear(
     )
 
 
+def test_grouped_mm_gradient_is_aligned_for_tp_sharded_rank() -> None:
+    gradient = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+
+    aligned = multi_lora_layers_module._AlignedGroupedMMGradient.backward(
+        None,
+        gradient,
+    )
+
+    assert aligned.stride() == (8, 1)
+    assert torch.equal(aligned, gradient)
+
+
 def adapter_deps_patch() -> ExitStack:
     """Patch the layer module's adapter construction dependencies for CPU use."""
     stack = ExitStack()
