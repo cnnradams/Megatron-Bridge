@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple
 
 import torch
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.transformer.moe.router import TopKRouter
 from torch import nn
 
@@ -40,6 +42,28 @@ from megatron.bridge.peft.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _gather_qkv_projections(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sizes = (query.size(-1), key.size(-1), value.size(-1))
+    gathered = gather_from_tensor_model_parallel_region(torch.cat((query, key, value), dim=-1))
+    world_size = parallel_state.get_tensor_model_parallel_world_size()
+    gathered = gathered.reshape(*query.shape[:-1], world_size, sum(sizes))
+    offsets = (0, sizes[0], sizes[0] + sizes[1])
+    return tuple(
+        torch.cat(
+            tuple(
+                gathered[..., rank, offset : offset + size]
+                for rank in range(world_size)
+            ),
+            dim=-1,
+        )
+        for offset, size in zip(offsets, sizes)
+    )
+
+
 def _interleave_qkv_outputs(
     wrapped_module: nn.Module,
     query: torch.Tensor,
@@ -51,6 +75,12 @@ def _interleave_qkv_outputs(
     head_num = getattr(config, "num_attention_heads", None)
     num_query_groups = getattr(config, "num_query_groups", None)
     head_size = getattr(config, "kv_channels", None)
+    world_size = parallel_state.get_tensor_model_parallel_world_size()
+    gather_projections = (
+        num_query_groups is not None and num_query_groups < world_size
+    )
+    if gather_projections:
+        query, key, value = _gather_qkv_projections(query, key, value)
 
     if head_size is None:
         hidden_size = getattr(config, "hidden_size", None)
@@ -109,7 +139,12 @@ def _interleave_qkv_outputs(
         qkv_chunks.extend([k_group, v_group])
 
     qkv = torch.cat(qkv_chunks, dim=1)
-    return qkv.reshape(*leading_shape, -1)
+    qkv = qkv.reshape(*leading_shape, -1)
+    if gather_projections:
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        local_size = qkv.size(-1) // world_size
+        qkv = qkv[..., rank * local_size : (rank + 1) * local_size]
+    return qkv
 
 
 def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:

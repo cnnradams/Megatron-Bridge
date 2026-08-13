@@ -47,6 +47,7 @@ import torch
 import torch.nn as nn
 
 from megatron.bridge.models.conversion.peft_bridge import MegatronPeftBridge
+from megatron.bridge.peft import canonical_lora as canonical_lora_module
 from megatron.bridge.peft import multi_lora as multi_lora_mod
 from megatron.bridge.peft import multi_lora_layers as multi_lora_layers_module
 from megatron.bridge.peft.multi_lora import MultiLoRA
@@ -425,6 +426,73 @@ class TestMultiLoRALinearSplitQKV:
             ]
         ).reshape(1, -1)
         assert bias is None
+        assert torch.equal(output, expected)
+
+    def test_interleaves_gated_gqa_when_tp_exceeds_query_groups(self) -> None:
+        wrapped = MagicMock()
+        wrapped.config = type(
+            "Config",
+            (),
+            {
+                "kv_channels": 4,
+                "num_attention_heads": 4,
+                "num_query_groups": 1,
+                "attention_output_gate": True,
+            },
+        )()
+        query = torch.cat(
+            [
+                torch.full((4,), i + 1, dtype=torch.float32)
+                for i in range(8)
+            ]
+        ).reshape(1, -1)
+        key = torch.full((1, 4), 10, dtype=torch.float32)
+        value = torch.full((1, 4), 20, dtype=torch.float32)
+        local_sizes = (query.size(-1) // 2, key.size(-1) // 2, value.size(-1) // 2)
+        gathered = torch.cat(
+            [
+                query[:, : local_sizes[0]],
+                key[:, : local_sizes[1]],
+                value[:, : local_sizes[2]],
+                query[:, local_sizes[0] :],
+                key[:, local_sizes[1] :],
+                value[:, local_sizes[2] :],
+            ],
+            dim=-1,
+        )
+
+        with (
+            patch.object(
+                canonical_lora_module.parallel_state,
+                "get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch.object(
+                canonical_lora_module,
+                "gather_from_tensor_model_parallel_region",
+                return_value=gathered,
+            ),
+            patch.object(
+                canonical_lora_module.parallel_state,
+                "get_tensor_model_parallel_rank",
+                return_value=1,
+            ),
+        ):
+            output = canonical_lora_module._interleave_qkv_outputs(
+                wrapped,
+                query[:, : local_sizes[0]],
+                key[:, : local_sizes[1]],
+                value[:, : local_sizes[2]],
+            )
+
+        heads = query.reshape(4, 8)
+        expected = torch.cat(
+            [
+                heads[1:, 4:].reshape(-1),
+                key.reshape(-1),
+                value.reshape(-1),
+            ]
+        ).reshape(1, -1)
         assert torch.equal(output, expected)
 
     def test_expose_slot_uses_canonical_adapter_layout_and_scaling(self) -> None:
