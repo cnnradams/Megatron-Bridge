@@ -86,6 +86,7 @@ ADAPTER_NAME_MAP = {
     ".v_proj.weight": "adapter_v",
     ".gate_proj.weight": "adapter_gate",
     ".x_proj.weight": "adapter_x",
+    ".in_proj_z.weight": "adapter_z",
     ".up_proj.weight": "adapter_up",
 }
 ADAPTER_KEY_TO_SUFFIX = {value: key for key, value in ADAPTER_NAME_MAP.items()}
@@ -97,6 +98,34 @@ MEGATRON_TO_HF_LORA_SUFFIX = {
 }
 
 GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+
+
+def _gdn_split_adapter_base_name(
+    hf_param: Union[str, Dict[str, str]],
+    adapter_key: Optional[str],
+) -> Optional[str]:
+    """Resolve a synthetic split Q/K/V/Z name for a fused GDN base mapping."""
+    if not isinstance(hf_param, dict):
+        return None
+    values = list(hf_param.values())
+    qkv_name = next(
+        (value for value in values if value.endswith(".in_proj_qkv.weight")),
+        None,
+    )
+    if qkv_name is None:
+        return None
+    if adapter_key in {"adapter_q", "adapter_k", "adapter_v"}:
+        projection = adapter_key.removeprefix("adapter_")
+        return qkv_name.replace(
+            ".in_proj_qkv.weight",
+            f".in_proj_{projection}.weight",
+        )
+    if adapter_key == "adapter_z":
+        return next(
+            (value for value in values if value.endswith(".in_proj_z.weight")),
+            None,
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -128,6 +157,9 @@ def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expecte
     """Return the HF base parameter name associated with this adapter."""
 
     hf_param = base_mapping.hf_param
+    gdn_name = _gdn_split_adapter_base_name(hf_param, adapter_key)
+    if gdn_name is not None:
+        return gdn_name
     if isinstance(hf_param, str):
         adapter_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
         if (
@@ -237,6 +269,9 @@ class MegatronPeftBridge:
             return []
 
         hf_param = base_mapping.hf_param
+        gdn_name = _gdn_split_adapter_base_name(hf_param, adapter_key)
+        if gdn_name is not None:
+            return [gdn_name]
         if isinstance(hf_param, str):
             adapter_suffix = ADAPTER_KEY_TO_SUFFIX.get(adapter_key)
             if (

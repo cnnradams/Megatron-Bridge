@@ -344,7 +344,9 @@ class MultiLoRALinearSplitQKV(MultiLoRALinear):
     def _build_adapter_slot(self, attrs: AdapterAttributes) -> ModuleDict:
         config = self.to_wrap.config
         head_size = config.kv_channels
-        q_out_features = head_size * config.num_attention_heads
+        q_out_features = (
+            head_size * config.num_attention_heads * (2 if getattr(config, "attention_output_gate", False) else 1)
+        )
         kv_out_features = head_size * config.num_query_groups
         return ModuleDict(
             {
@@ -376,6 +378,69 @@ class MultiLoRALinearSplitQKV(MultiLoRALinear):
             projections["adapter_k"],
             projections["adapter_v"],
         )
+        return linear_output + adapter_output.reshape(linear_output.shape), bias
+
+
+class MultiLoRALinearSplitGDNInProj(MultiLoRALinear):
+    """Multi-slot LoRA with independent Q/K/V/Z adapters for GDN in_proj."""
+
+    def _build_adapter_slot(self, attrs: AdapterAttributes) -> ModuleDict:
+        config = self.to_wrap.config
+        qk_out_features = config.linear_key_head_dim * config.linear_num_key_heads
+        value_out_features = config.linear_value_head_dim * config.linear_num_value_heads
+        return ModuleDict(
+            {
+                "adapter_q": self._build_adapter(attrs, qk_out_features),
+                "adapter_k": self._build_adapter(attrs, qk_out_features),
+                "adapter_v": self._build_adapter(attrs, value_out_features),
+                "adapter_z": self._build_adapter(attrs, value_out_features),
+            }
+        )
+
+    def _slot_adapters(self, idx: int) -> Tuple[ParallelLinearAdapter, ...]:
+        slot = self.adapters[idx]
+        return tuple(slot.values())
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        linear_output, bias, layernorm_output = self.base_linear_forward(
+            x,
+            *args,
+            **kwargs,
+        )
+        if not self._adapter_enabled:
+            return linear_output, bias
+
+        x_flat, tokens_per_adapter = self._prepare_adapter_input(
+            layernorm_output,
+        )
+        projections = []
+        for adapter_key in (
+            "adapter_q",
+            "adapter_k",
+            "adapter_v",
+            "adapter_z",
+        ):
+            adapters = [slot[adapter_key] for slot in self.adapters]
+            projection = self._forward_adapter_group(
+                x_flat,
+                tokens_per_adapter,
+                adapters,
+            )
+            projections.append(self._finish_adapter_output(projection))
+
+        trailing_features = linear_output.shape[-1] - sum(projection.shape[-1] for projection in projections)
+        if trailing_features < 0:
+            raise RuntimeError(f"{self.base_linear_name}: adapter projections exceed packed GDN in_proj output")
+        untouched = linear_output.new_zeros(
+            *projections[0].shape[:-1],
+            trailing_features,
+        )
+        adapter_output = torch.cat((*projections, untouched), dim=-1)
         return linear_output + adapter_output.reshape(linear_output.shape), bias
 
 

@@ -51,6 +51,7 @@ def _interleave_qkv_outputs(
     head_num = getattr(config, "num_attention_heads", None)
     num_query_groups = getattr(config, "num_query_groups", None)
     head_size = getattr(config, "kv_channels", None)
+    attention_output_gate = getattr(config, "attention_output_gate", False)
 
     if head_size is None:
         hidden_size = getattr(config, "hidden_size", None)
@@ -69,8 +70,9 @@ def _interleave_qkv_outputs(
                 "Cannot infer head size without kv_channels or hidden_size/num_attention_heads or num_query_groups."
             )
 
-    if query.size(-1) % head_size != 0:
-        raise ValueError("Query projection size must be divisible by head_size.")
+    query_head_size = head_size * (2 if attention_output_gate else 1)
+    if query.size(-1) % query_head_size != 0:
+        raise ValueError("Query projection size must be divisible by its gated head size.")
     if key.size(-1) % head_size != 0:
         raise ValueError("Key projection size must be divisible by head_size.")
     if value.size(-1) != key.size(-1):
@@ -79,14 +81,17 @@ def _interleave_qkv_outputs(
     # Adapter outputs are TP-local for a column-parallel linear_qkv. Derive the
     # local head/group counts from those outputs rather than reshaping with the
     # global counts stored in the TransformerConfig.
-    head_num = query.size(-1) // head_size
+    head_num = query.size(-1) // query_head_size
     num_query_groups = key.size(-1) // head_size
     if head_num % num_query_groups != 0:
         raise ValueError("num_attention_heads must be divisible by num_query_groups.")
 
     heads_per_group = head_num // num_query_groups
     leading_shape = query.shape[:-1]
-    query = query.reshape(-1, head_num, head_size)
+    query = query.reshape(-1, head_num, query_head_size)
+    gate = None
+    if attention_output_gate:
+        query, gate = torch.chunk(query, 2, dim=-1)
     key = key.reshape(-1, num_query_groups, head_size)
     value = value.reshape(-1, num_query_groups, head_size)
 
@@ -95,7 +100,11 @@ def _interleave_qkv_outputs(
         q_group = query[:, i * heads_per_group : (i + 1) * heads_per_group, :]
         k_group = key[:, i : i + 1, :]
         v_group = value[:, i : i + 1, :]
-        qkv_chunks.extend([q_group, k_group, v_group])
+        qkv_chunks.append(q_group)
+        if gate is not None:
+            gate_group = gate[:, i * heads_per_group : (i + 1) * heads_per_group, :]
+            qkv_chunks.append(gate_group)
+        qkv_chunks.extend([k_group, v_group])
 
     qkv = torch.cat(qkv_chunks, dim=1)
     return qkv.reshape(*leading_shape, -1)
@@ -392,7 +401,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
             if name == "linear_qkv":
                 adapter_q, adapter_k, adapter_v = None, None, None
                 kv_out_features = m.config.kv_channels * m.config.num_query_groups
-                q_out_features = m.config.kv_channels * m.config.num_attention_heads
+                q_out_features = (
+                    m.config.kv_channels
+                    * m.config.num_attention_heads
+                    * (2 if getattr(m.config, "attention_output_gate", False) else 1)
+                )
                 if "linear_q" in canonical_submodules:
                     adapter_q = adapter_cls(attrs.in_features, q_out_features, **adapter_kwargs)
                 if "linear_k" in canonical_submodules:
