@@ -2331,12 +2331,14 @@ class GatedMLPMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
 class RMSNorm2ZeroCenteredRMSNormMapping(AutoMapping):
     """
     Mapping for zero-centered RMSNorm to standard RMSNorm.
+
+    The coordinate shift must happen in FP32. A small BF16 zero-centered
+    update can be represented near zero, but adding one in BF16 rounds that
+    update away and makes the HF roundtrip lossy.
     """
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
-        hf_weights = hf_weights.clone()
-        hf_weights.data -= 1
-        return super().hf_to_megatron(hf_weights, megatron_module)
+        return super().hf_to_megatron(hf_weights.float() - 1.0, megatron_module)
 
     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
         hf_weights = super().megatron_to_hf(megatron_weights, megatron_module)
@@ -2344,9 +2346,7 @@ class RMSNorm2ZeroCenteredRMSNormMapping(AutoMapping):
             f"Expected a dictionary with one element, got {hf_weights.keys()=}"
         )
         key = list(hf_weights.keys())[0]
-        value = hf_weights[key].clone()
-        value.data += 1
-        return {key: value}
+        return {key: hf_weights[key].float() + 1.0}
 
 
 def _align_expert_weight_to_shape(
