@@ -28,6 +28,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     KVMapping,
     QKVMapping,
     ReplicatedMapping,
+    RMSNorm2ZeroCenteredRMSNormMapping,
     RowParallelMapping,
     merge_kv_biases,
     merge_kv_weights,
@@ -125,6 +126,27 @@ class TestDirectMapping:
         hf_weights = mapping.megatron_to_hf(megatron_weight, None)
         assert "hf.weight" in hf_weights
         assert torch.equal(hf_weights["hf.weight"], megatron_weight)
+
+
+class TestRMSNorm2ZeroCenteredRMSNormMapping:
+    def test_bfloat16_roundtrip_is_exact(self, mock_distributed_env, transformer_config):
+        mock_distributed_env()
+        module = MockModule(transformer_config, weight_shape=(4,))
+        module.tensor_model_parallel = False
+        weight = torch.tensor(
+            [0.0001, -0.0001, 0.001, -0.001],
+            dtype=torch.bfloat16,
+        )
+        mapping = RMSNorm2ZeroCenteredRMSNormMapping(
+            "megatron.weight",
+            "hf.weight",
+        )
+
+        hf_weight = mapping.megatron_to_hf(weight, module)["hf.weight"]
+        restored = mapping.hf_to_megatron(hf_weight, module).to(weight.dtype)
+
+        assert hf_weight.dtype == torch.float32
+        assert torch.equal(restored, weight)
 
 
 class TestReplicatedMapping:
